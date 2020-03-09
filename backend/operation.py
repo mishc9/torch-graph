@@ -195,7 +195,6 @@ def traverse_postorder(operation):
 
     for op in operation:
         recurse(op)
-    # nodes_postorder
     return nodes_postorder
 
 
@@ -213,10 +212,17 @@ class Session:
     tensor([ 2., -1.])
     >>> type(output)
     <class 'torch.Tensor'>
+    >>> output = session.run([z], {x: [1, 2]})
+    >>> output
+    [tensor([ 2., -1.])]
     """
 
     def run(self, operation, feed_dict=None, **kwargs):
         feed_dict = feed_dict or {}
+
+        return_as = None
+        if isinstance(operation, list) or isinstance(operation, tuple):
+            return_as = True
 
         operation = to_list(operation)
 
@@ -230,8 +236,12 @@ class Session:
             else:
                 node.inputs = [input_node.output for input_node in node.input_nodes]
                 node.output = node.compute(*node.inputs)
+        result = [op.output for op in operation]
 
-        return unpack_singleton([op.output for op in operation])
+        if return_as is not None:
+            return result
+        else:
+            return unpack_singleton(result)
 
 
 class negative(Operation):
@@ -358,16 +368,18 @@ class Function(object):
                             'should be a list or tuple.')
         self.inputs = list(inputs)
         self.outputs = list(outputs)
-        with ops.control_dependencies(self.outputs):
-            updates_ops = []
-            for update in updates:
-                if isinstance(update, tuple):
-                    p, new_p = update
-                    updates_ops.append(state_ops.assign(p, new_p))
-                else:
-                    # assumed already an op
-                    updates_ops.append(update)
-            self.updates_op = control_flow_ops.group(*updates_ops)
+        # with ops.control_dependencies(self.outputs):
+        #     updates_ops = []
+        #     for update in updates:
+        #         if isinstance(update, tuple):
+        #             p, new_p = update
+        #             updates_ops.append(state_ops.assign(p, new_p))
+        #         else:
+        #             # assumed already an op
+        #             updates_ops.append(update)
+        #     self.updates_op = control_flow_ops.group(*updates_ops)
+        # Todo: recover updates_ops. For a while I use patch.
+        self.updates_op = None
         self.name = name
         self.session_kwargs = session_kwargs
 
@@ -384,7 +396,7 @@ class Function(object):
             feed_dict[tensor] = value
         session = get_session()
         updated = session.run(
-            self.outputs + [self.updates_op],
+            self.outputs + ([self.updates_op] if self.updates_op is not None else []),
             feed_dict=feed_dict,
             **self.session_kwargs)
         return updated[:len(self.outputs)]
@@ -401,12 +413,21 @@ def function(inputs, outputs, updates=None, **kwargs):
         Output values as Numpy arrays.
     Raises:
         ValueError: if invalid kwargs are passed in.
+    >>> Graph().as_default()
+    >>> A = Variable([[1, 0], [0, -1]])
+    >>> b = Variable([1, 1])
+    >>> x = placeholder()
+    >>> y = matmul(A, x)
+    >>> z = add(y, b)
+    >>> f = function([x], [z])
+    >>> f([[1, 2]])
+    [tensor([ 2., -1.])]
     """
-    if kwargs:
-        for key in kwargs:
-            if (key not in tf_inspect.getargspec(session_module.Session.run)[0] and
-                    key not in tf_inspect.getargspec(Function.__init__)[0]):
-                msg = ('Invalid argument "%s" passed to K.function with Tensorflow '
-                       'backend') % key
-                raise ValueError(msg)
+    # if kwargs:
+    #     for key in kwargs:
+    #         if (key not in tf_inspect.getargspec(session_module.Session.run)[0] and
+    #                 key not in tf_inspect.getargspec(Function.__init__)[0]):
+    #             msg = ('Invalid argument "%s" passed to K.function with Tensorflow '
+    #                    'backend') % key
+    #             raise ValueError(msg)
     return Function(inputs, outputs, updates=updates, **kwargs)
