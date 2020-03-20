@@ -4,6 +4,41 @@ import torch
 _graph_registry = {}
 
 
+class _ControlDepsController():
+    """
+    Mimics old _ControlDependenciesController:
+    https://github.com/tensorflow/tensorflow/blob/e5bf8de410005de06a7ff5393fafdf832ef1d4ad/tensorflow/python/framework/ops.py#L4353
+    """
+    def __init__(self, graph, control_inputs):
+        self._graph: Graph = graph
+        self._control_inputs = control_inputs
+        if control_inputs is None:
+            self._control_inputs_val = []
+            self._new_stack = True
+        else:
+            self._control_inputs_val = []
+            self._new_stack = False
+        self._seen_nodes = set()
+        self._old_stack = False
+        self._old_control_flow_context = None
+
+    def __enter__(self):
+        if self._new_stack:
+            # Clear the control_dependencies graph.
+            self._old_stack = self._graph._control_dependencies_stack
+            self._graph._control_dependencies_stack = []
+            # Clear the control_flow_context too.
+            self._old_control_flow_context = self._graph._get_control_flow_context()
+            self._graph._set_control_flow_context(None)
+        self._graph._push_control_dependencies_controller(self)
+
+    def __exit__(self, unused_type, unused_value, unused_traceback):
+        self._graph._pop_control_dependencies_controller(self)
+        if self._new_stack:
+            self._graph._control_dependencies_stack = self._old_stack
+            self._graph._set_control_flow_context(self._old_control_flow_context)
+
+
 class Graph:
     """
     Create a new graph
@@ -14,11 +49,38 @@ class Graph:
         self.placeholders = []
         self.variables = []
 
+        self._control_flow_context = None
+        # Contains list of controllers. Each controller has an attribute _control_inputs_val,
+        # which in turn contains a list if control_inputs
+        self._control_dependencies_stack = []
+
     def as_default(self):
         _graph_registry[self.__class__] = self
 
+    def control_dependencies(self, control_inputs):
+        # Should return something like
+        # https://github.com/tensorflow/tensorflow/blob/e5bf8de410005de06a7ff5393fafdf832ef1d4ad/tensorflow/python/framework/ops.py#L4353
+        return _ControlDepsController(self, control_inputs)
+
+    def _get_control_flow_context(self):
+        return self._control_flow_context
+
+    def _set_control_flow_context(self, context):
+        self._control_flow_context = context
+
+    def _push_control_dependencies_controller(self, controller):
+        self._control_dependencies_stack.append(controller)
+
+    def _pop_control_dependencies_controller(self, controller):
+        assert self._control_dependencies_stack[-1] is controller
+        self._control_dependencies_stack.pop()
+
 
 def get_default_graph():
+    """
+    Returns a graph which was set default. If there's no such graph, creates and returns one.
+    :return: Graph
+    """
     try:
         return _graph_registry[Graph]
     except KeyError:
@@ -63,7 +125,7 @@ class Session:
 
         nodes_postorder = traverse_postorder(operation)
 
-        # Note #3: assign operation is specific. It's unary operation. And it does
+        # Note #3: assign operation is different. It's unary operation. And it does
         # the following: placeholder -> (assign) -> Variable.
         # So, I use a trick to ignore assign operations which have placeholders, but
         # these placeholder just have no relative values in a feed_dict.
@@ -86,6 +148,8 @@ class Session:
                 if (isinstance(node, assign) and skip_next_assign):
                     skip_next_assign = False
                     continue
+                elif skip_next_assign:
+                    raise ValueError("Next node should be assign op, bu get {}".format(str(type(node))))
                 node.inputs = [input_node.output for input_node in node.input_nodes]
                 node.output = node.compute(*node.inputs)
         result = [op.output for op in operation]
@@ -96,19 +160,34 @@ class Session:
             return unpack_singleton(result)
 
 
+def control_dependencies(outputs):
+    """
+    Get control dependencies context manager for default graph
+    :param outputs:
+    :return:
+    """
+    return get_default_graph().control_dependencies(outputs)
+
+
 class Operation:
     def __init__(self, input_nodes):
         self.input_nodes = input_nodes
 
         self.consumers = []
+        # Adding dependencies for control_dependencies
 
         for input_node in self.input_nodes:
             input_node.consumers.append(self)
 
-        get_default_graph().operations.append(self)
+        _graph: Graph = get_default_graph()
+        _graph.operations.append(self)
+        if _graph._control_dependencies_stack:
+            self.control_dependencies = _graph._control_dependencies_stack[-1]._control_inputs_val
+        else:
+            self.control_dependencies = []
 
     def compute(self, *args, **kwargs):
-        pass
+        raise NotImplementedError
 
     def __call__(self, *args, **kwargs):
         return self.compute(*args, **kwargs)
@@ -308,8 +387,9 @@ def traverse_postorder(operation):
         # How to connect assign operations (source of variables) to the main graph?
         if node not in nodes_set:
             # if isinstance(node, assign):
-
             if isinstance(node, Operation):
+                for dependency_node in node.control_dependencies:
+                    recurse(dependency_node)
                 for input_node in node.input_nodes:
                     recurse(input_node)
             if isinstance(node, Variable) and hasattr(node, '_assign_op'):
@@ -418,8 +498,31 @@ def unpack_singleton(x):
 
 
 def get_session():
+    """
+    get session
+    :return:
+    """
+    # Todo: implement default session mechanism
     # https://github.com/tensorflow/tensorflow/blob/81012dcd91770dc8113cd5beb4f854968c27e272/tensorflow/python/keras/_impl/keras/backend.py#L345
     return Session()
+
+
+
+class no_op(Operation):
+    def __init__(self, input_nodes):
+        super().__init__(input_nodes)
+
+    def compute(self):
+        pass
+
+
+def group(*updates_ops):
+    """
+    Group operations / tensors into a single operation
+    :type updates_ops: object
+    :return:
+    """
+    return no_op(updates_ops)
 
 
 class Function(object):
@@ -446,18 +549,20 @@ class Function(object):
                             'should be a list or tuple.')
         self.inputs = list(inputs)
         self.outputs = list(outputs)
-        # with ops.control_dependencies(self.outputs):
-        #     updates_ops = []
-        #     for update in updates:
-        #         if isinstance(update, tuple):
-        #             p, new_p = update
-        #             updates_ops.append(state_ops.assign(p, new_p))
-        #         else:
-        #             # assumed already an op
-        #             updates_ops.append(update)
-        #     self.updates_op = control_flow_ops.group(*updates_ops)
+        # Note # 5: We require control dependencies for opportunity to calculate gradients and apply them to variables
+        # in one optimizer step.
+        # Todo: test control dedepdencies
+        with control_dependencies(self.outputs):
+            updates_ops = []
+            for update in updates:
+                if isinstance(update, tuple):
+                    p, new_p = update
+                    updates_ops.append(assign(p, new_p))
+                else:
+                    # assumed already an op
+                    updates_ops.append(update)  # Create single op from them
+            self.updates_op = group(*updates_ops)
         # Todo: recover updates_ops. For a while I use patch.
-        self.updates_op = None
         self.name = name
         self.session_kwargs = session_kwargs
 
@@ -474,7 +579,7 @@ class Function(object):
             feed_dict[tensor] = value
         session = get_session()
         updated = session.run(
-            self.outputs + ([self.updates_op] if self.updates_op is not None else []),
+            self.outputs + [self.updates_op],
             feed_dict=feed_dict,
             **self.session_kwargs)
         return updated[:len(self.outputs)]
@@ -559,7 +664,7 @@ def set_value(x, value):
     # TODO: make pytorch-specific dtype processing
     tf_dtype = _convert_string_dtype(str(x.dtype).split('.')[1])
     # Note #1
-    # tf backend uses _assign_placeholder of Variable to set new values.
+    # tf backend uses _assign_placeholder attribute of Variable to set new values.
     # Guess I don't need this as for now torchy Varibales are much simpler and don't depend
     # on tf's (over?)-complicated conceptions
     # ...
