@@ -1,4 +1,5 @@
 # torch-graph
+Doing it for fun. Also whant to understand better tensorflow core and [dataflow](https://en.wikipedia.org/wiki/Dataflow_programming) paradigm impementations.
 Draft of computational graph for pytorch. Intended to be a keras backend in the future.
 
 # Issues & targets:
